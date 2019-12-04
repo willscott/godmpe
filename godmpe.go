@@ -46,6 +46,8 @@ var rootCmd = &cobra.Command{
 			s := getSectionByRVA(peFile, uint32(memRng.Addr))
 			if s != nil {
 				patchSpace(memRng, peFile, s)
+			} else if s = getSectionByRVA(peFile, uint32(memRng.Addr)+uint32(len(memRng.Data))); s != nil {
+				patchSpace(memRng, peFile, s)
 			} else if len(newSegments) > 0 {
 				prevSeg := newSegments[len(newSegments)-1]
 				if prevSeg.Addr+uint64(len(prevSeg.Data)) == memRng.Addr {
@@ -67,11 +69,7 @@ var rootCmd = &cobra.Command{
 			copy(h.Data.Name[:], name[:])
 			h.Data.VirtualAddress = uint32(seg.Addr)
 			h.Data.SizeOfRawData = uint32(len(seg.Data))
-			h.Data.Characteristics = pe.SectionCharacteristics["IMAGE_SCN_CNT_INITIALIZED_DATA"] |
-				pe.SectionCharacteristics["IMAGE_SCN_ALIGN_16BYTES"] |
-				pe.SectionCharacteristics["IMAGE_SCN_MEM_EXECUTE"] |
-				pe.SectionCharacteristics["IMAGE_SCN_MEM_READ"] |
-				pe.SectionCharacteristics["IMAGE_SCN_MEM_WRITE"]
+			h.Data.Characteristics = getCharacteristicsAtAddress(dmp, seg.Addr)
 			peFile.Sections = append(peFile.Sections, h)
 			peFile.COFFFileHeader.Data.NumberOfSections++
 		}
@@ -87,16 +85,65 @@ func main() {
 	rootCmd.Execute()
 }
 
+func getCharacteristicsAtAddress(dmp *minidump.Minidump, addr uint64) uint32 {
+	// try to find a meminfo for this address.
+	for _, info := range dmp.MemoryInfo {
+		if info.Addr <= addr && info.Addr+info.Size >= addr {
+			char := uint32(0)
+			if (info.Protection & minidump.MemoryProtectReadOnly) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_READ"]
+			}
+			if (info.Protection & minidump.MemoryProtectReadWrite) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_READ"]
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_WRITE"]
+			}
+			if (info.Protection & minidump.MemoryProtectWriteCopy) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_WRITE"]
+			}
+			if (info.Protection & minidump.MemoryProtectExecute) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_EXECUTE"]
+			}
+			if (info.Protection & minidump.MemoryProtectExecuteRead) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_EXECUTE"]
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_READ"]
+			}
+			if (info.Protection & minidump.MemoryProtectExecuteReadWrite) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_EXECUTE"]
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_READ"]
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_WRITE"]
+			}
+			if (info.Protection & minidump.MemoryProtectNoCache) != 0 {
+				char |= pe.SectionCharacteristics["IMAGE_SCN_MEM_NOT_CACHED"]
+			}
+			return char
+		}
+	}
+
+	return pe.SectionCharacteristics["IMAGE_SCN_CNT_INITIALIZED_DATA"] |
+		pe.SectionCharacteristics["IMAGE_SCN_ALIGN_16BYTES"] |
+		pe.SectionCharacteristics["IMAGE_SCN_MEM_EXECUTE"] |
+		pe.SectionCharacteristics["IMAGE_SCN_MEM_READ"] |
+		pe.SectionCharacteristics["IMAGE_SCN_MEM_WRITE"]
+}
 func patchSpace(region minidump.MemoryRange, p *pe.PEFile, segment *pe.SectionHeader) bool {
 	sliceStart := uint32(region.Addr) - segment.Data.VirtualAddress
-	if len(region.Data)+int(sliceStart) <= len(segment.DataBytes) {
+	if uint32(region.Addr) >= segment.Data.VirtualAddress && len(region.Data)+int(sliceStart) <= len(segment.DataBytes) {
 		if bytes.Equal(region.Data, segment.DataBytes[sliceStart:sliceStart+uint32(len(region.Data))]) {
 			fmt.Printf("byte-equal replacement of memory space requested.")
 			return false
 		}
+	} else if uint32(region.Addr) < segment.Data.VirtualAddress {
+		// prepend the segment down to the start of the region w/ 0's, then proceed normally.
+		prefill := segment.Data.VirtualAddress - uint32(region.Addr)
+		zeros := make([]byte, prefill)
+		segment.DataBytes = append(zeros, segment.DataBytes...)
+		segment.Data.SizeOfRawData += prefill
+		segment.Data.VirtualAddress = uint32(region.Addr)
+		sliceStart = 0
 	}
 	newMem := make([]byte, max(uint32(len(segment.DataBytes)), uint32(len(region.Data))+sliceStart))
 	copy(newMem[:], segment.DataBytes[:])
+	copy(newMem[sliceStart:sliceStart+uint32(len(region.Data))], region.Data[:])
 	segment.DataBytes = newMem
 	segment.Data.SizeOfRawData = uint32(len(newMem))
 
